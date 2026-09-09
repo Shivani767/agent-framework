@@ -98,6 +98,19 @@ def test_mcp_transport_subclasses_accept_tool_name_prefix() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "tool",
+    [
+        MCPStdioTool(name="stdio", command="python", result_content_mode="both"),
+        MCPStreamableHTTPTool(name="http", url="http://localhost:8080", result_content_mode="both"),
+        MCPWebsocketTool(name="websocket", url="ws://localhost:8080", result_content_mode="both"),
+    ],
+)
+def test_mcp_transports_forward_result_content_mode(tool: MCPTool) -> None:
+    """Every transport exposes the base result-content selection policy."""
+    assert tool.result_content_mode == "both"
+
+
 async def test_load_tools_with_tool_name_prefix_preserves_matching_configuration():
     """Prefixed MCP tool names should still honor unprefixed allow/approval configuration."""
     tool = MCPTool(  # type: ignore[abstract]
@@ -473,7 +486,7 @@ def test_parse_tool_result_from_mcp_structured_content_only():
 
 
 def test_parse_tool_result_from_mcp_structured_content_with_text():
-    """Complementary human-readable text is kept alongside structuredContent."""
+    """The default structured-first mode selects structuredContent."""
     mcp_result = types.CallToolResult(
         content=[types.TextContent(type="text", text="Summary")],
         structuredContent={"data": [1, 2, 3]},
@@ -481,12 +494,10 @@ def test_parse_tool_result_from_mcp_structured_content_with_text():
     result = _HELPER_MCP_TOOL._parse_tool_result_from_mcp(mcp_result)
 
     assert isinstance(result, list)
-    assert len(result) == 2
+    assert len(result) == 1
     assert result[0].type == "text"
     assert result[0].text is not None
     assert json.loads(result[0].text) == {"data": [1, 2, 3]}
-    assert result[1].type == "text"
-    assert result[1].text == "Summary"
 
 
 def test_parse_tool_result_from_mcp_does_not_duplicate_equivalent_structured_content():
@@ -524,7 +535,7 @@ def test_parse_tool_result_from_mcp_structured_content_stamps_meta():
 
 
 def test_parse_tool_result_from_mcp_keeps_rich_content_with_structured():
-    """Non-text content blocks must not be dropped when structuredContent is present."""
+    """The ``both`` mode preserves rich content alongside structuredContent."""
     mcp_result = types.CallToolResult(
         content=[
             types.ImageContent(
@@ -536,15 +547,60 @@ def test_parse_tool_result_from_mcp_keeps_rich_content_with_structured():
         ],
         structuredContent={"caption": "caption echoed in structured", "width": 32},
     )
-    result = _HELPER_MCP_TOOL._parse_tool_result_from_mcp(mcp_result)
+    tool = MCPTool(name="helper", result_content_mode="both")  # type: ignore[abstract]
+    result = tool._parse_tool_result_from_mcp(mcp_result)
 
-    assert len(result) == 2
+    assert len(result) == 3
     assert result[0].type == "text"
     assert result[0].text is not None
     assert json.loads(result[0].text) == {"caption": "caption echoed in structured", "width": 32}
     assert result[1].type == "data"
     assert result[1].media_type == "image/png"
     assert "ZmFrZS1pbWFnZS1ieXRlcw==" in result[1].uri  # type: ignore[operator]
+    assert result[2].type == "text"
+    assert result[2].text == "caption echoed in structured"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_texts"),
+    [
+        ("structured_first", ['{"structured": true}']),
+        ("content_first", ["summary"]),
+        ("content_only", ["summary"]),
+        ("structured_only", ['{"structured": true}']),
+        ("both", ['{"structured": true}', "summary"]),
+    ],
+)
+def test_parse_tool_result_from_mcp_result_content_mode(mode: str, expected_texts: list[str]):
+    """Each explicit result-content policy has predictable selection behavior."""
+    tool = MCPTool(name="helper", result_content_mode=mode)  # type: ignore[abstract, arg-type]
+    mcp_result = types.CallToolResult(
+        content=[types.TextContent(type="text", text="summary")],
+        structuredContent={"structured": True},
+    )
+
+    result = tool._parse_tool_result_from_mcp(mcp_result)
+
+    assert [item.text for item in result] == expected_texts
+
+
+def test_parse_tool_result_from_mcp_both_mode_preserves_distinct_json_types():
+    """The explicit ``both`` policy never conflates JSON values such as 1 and true."""
+    tool = MCPTool(name="helper", result_content_mode="both")  # type: ignore[abstract]
+    mcp_result = types.CallToolResult(
+        content=[types.TextContent(type="text", text='{"approved": 1}')],
+        structuredContent={"approved": True},
+    )
+
+    result = tool._parse_tool_result_from_mcp(mcp_result)
+
+    assert [item.text for item in result] == ['{"approved": true}', '{"approved": 1}']
+
+
+def test_mcp_tool_rejects_unknown_result_content_mode():
+    """Result selection policies are validated at construction time."""
+    with pytest.raises(ValueError, match="result_content_mode"):
+        MCPTool(name="helper", result_content_mode="deduplicate")  # type: ignore[abstract, arg-type]
 
 
 def test_parse_tool_result_from_mcp_structured_content_none():

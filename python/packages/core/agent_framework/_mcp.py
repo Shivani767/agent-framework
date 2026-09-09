@@ -137,6 +137,23 @@ MCP_DEFAULT_SSE_READ_TIMEOUT = 60 * 5
 _DEFAULT_SAMPLING_MAX_TOKENS = 4096
 _DEFAULT_SAMPLING_MAX_REQUESTS = 25
 
+# Controls how an MCP CallToolResult that contains both ``content`` and
+# ``structuredContent`` is represented to the agent.
+MCPResultContentMode: TypeAlias = Literal[
+    "structured_first",
+    "content_first",
+    "content_only",
+    "structured_only",
+    "both",
+]
+_MCP_RESULT_CONTENT_MODES: frozenset[str] = frozenset({
+    "structured_first",
+    "content_first",
+    "content_only",
+    "structured_only",
+    "both",
+})
+
 # A user-supplied gate invoked before each server-initiated sampling request is
 # forwarded to the chat client. It receives the raw ``CreateMessageRequestParams``
 # and returns (or awaits to) a truthy value to approve the request or a falsy
@@ -390,33 +407,6 @@ def _should_propagate_cancelled_error(ex: BaseException) -> bool:
     return task is not None and task.cancelling() > 0
 
 
-def _structured_content_contains_text(structured: Any, text: str) -> bool:
-    """Return whether *text* appears as a string value anywhere in *structured*."""
-    if isinstance(structured, str):
-        return structured == text
-    if isinstance(structured, Mapping):
-        return any(_structured_content_contains_text(value, text) for value in structured.values())
-    if isinstance(structured, Sequence) and not isinstance(structured, (str, bytes, bytearray)):
-        return any(_structured_content_contains_text(item, text) for item in structured)
-    return False
-
-
-def _text_duplicates_structured_content(text: str, structured: Any, structured_json: str) -> bool:
-    """Return whether a text content block is an echo of ``structuredContent``.
-
-    MCP servers often return the same payload as both a text ``content`` block and
-    ``structuredContent`` (for example ``{"result": "<same text>"}``). Treat those as
-    duplicates so agents are not charged twice. Complementary text (a human-readable
-    summary that is not present in the structured payload) is kept.
-    """
-    if text == structured_json:
-        return True
-    with contextlib.suppress(json.JSONDecodeError, TypeError):
-        if json.loads(text) == structured:
-            return True
-    return _structured_content_contains_text(structured, text)
-
-
 # region: MCP Plugin
 
 
@@ -460,6 +450,7 @@ class MCPTool:
         additional_tool_argument_names: Sequence[str] | Mapping[str, Sequence[str]] | None = None,
         use_progressive_disclosure: bool = False,
         always_load: Collection[str] | None = None,
+        result_content_mode: MCPResultContentMode = "structured_first",
     ) -> None:
         """Initialize the MCP Tool base.
 
@@ -525,9 +516,19 @@ class MCPTool:
             always_load: MCP tool names to keep visible from the start when progressive disclosure
                 is enabled. Names use the same safe matching rules as ``allowed_tools``; unmatched
                 entries are ignored.
+            result_content_mode: How to represent results that include both ``content`` and
+                ``structuredContent``. ``"structured_first"`` (the default) selects
+                structured content when present, otherwise regular content. ``"content_first"``
+                does the reverse; ``"content_only"`` and ``"structured_only"`` select only
+                the named source; and ``"both"`` preserves both, with structured content first.
         """
         if use_progressive_disclosure and not load_tools:
             raise ValueError("use_progressive_disclosure=True requires load_tools=True.")
+        if result_content_mode not in _MCP_RESULT_CONTENT_MODES:
+            raise ValueError(
+                "result_content_mode must be one of "
+                f"{', '.join(sorted(_MCP_RESULT_CONTENT_MODES))}; got {result_content_mode!r}."
+            )
         if use_progressive_disclosure:
             _warn_on_feature_use(
                 stage="experimental",
@@ -543,6 +544,7 @@ class MCPTool:
         self.additional_properties = additional_properties
         self.load_tools_flag = load_tools
         self.parse_tool_results = parse_tool_results
+        self.result_content_mode = result_content_mode
         self.load_prompts_flag = load_prompts
         self.parse_prompt_results = parse_prompt_results
         # Defer constructing the default MCPTaskOptions so the experimental warning
@@ -657,11 +659,10 @@ class MCPTool:
     ) -> list[Content]:
         """Parse an MCP CallToolResult into a list of Content items.
 
-        When ``structuredContent`` is present it is emitted first. Text (or embedded
-        text) ``content`` blocks that merely echo that structured payload are skipped
-        so servers such as MS Learn / DeepWiki do not duplicate tokens (#7866).
-        Non-text blocks (images, audio, resources) and complementary text that is not
-        represented in ``structuredContent`` are retained.
+        ``result_content_mode`` controls how a result that supplies both fields is
+        represented. This avoids guessing whether text from one field duplicates a
+        value nested in the other: such guesses can lose distinct JSON values and
+        require repeatedly scanning untrusted, arbitrarily large payloads.
 
         If the server attached a ``_meta`` payload to the tool result (e.g. for
         Information Flow Control labels under the ``ifc`` key), a copy of that
@@ -680,23 +681,14 @@ class MCPTool:
         # each newly constructed Content; empty when the server provided no meta.
         additional_kwargs: dict[str, Any] = {"additional_properties": {"_meta": meta}} if meta else {}
 
-        structured = mcp_type.structuredContent
-        structured_json: str | None = None
-        result: list[Content] = []
-        if structured is not None:
-            structured_json = json.dumps(structured, default=str)
-            result.append(Content.from_text(structured_json, **additional_kwargs))
-
+        content_result: list[Content] = []
         for item in mcp_type.content:
             match item:
                 case types.TextContent():
-                    if structured is not None and structured_json is not None:
-                        if _text_duplicates_structured_content(item.text, structured, structured_json):
-                            continue
-                    result.append(Content.from_text(item.text, **additional_kwargs))
+                    content_result.append(Content.from_text(item.text, **additional_kwargs))
                 case types.ImageContent() | types.AudioContent():
                     decoded = base64.b64decode(item.data)
-                    result.append(
+                    content_result.append(
                         Content.from_data(
                             data=decoded,
                             media_type=item.mimeType,
@@ -704,7 +696,7 @@ class MCPTool:
                         )
                     )
                 case types.ResourceLink():
-                    result.append(
+                    content_result.append(
                         Content.from_uri(
                             uri=str(item.uri),
                             media_type=item.mimeType,
@@ -714,18 +706,13 @@ class MCPTool:
                 case types.EmbeddedResource():
                     match item.resource:
                         case types.TextResourceContents():
-                            if structured is not None and structured_json is not None:
-                                if _text_duplicates_structured_content(
-                                    item.resource.text, structured, structured_json
-                                ):
-                                    continue
-                            result.append(Content.from_text(item.resource.text, **additional_kwargs))
+                            content_result.append(Content.from_text(item.resource.text, **additional_kwargs))
                         case types.BlobResourceContents():
                             blob = item.resource.blob
                             mime = item.resource.mimeType or "application/octet-stream"
                             if not blob.startswith("data:"):
                                 blob = f"data:{mime};base64,{blob}"
-                            result.append(
+                            content_result.append(
                                 Content.from_uri(
                                     uri=blob,
                                     media_type=mime,
@@ -733,11 +720,24 @@ class MCPTool:
                                 )
                             )
                 case _:
-                    fallback = str(item)
-                    if structured is not None and structured_json is not None:
-                        if _text_duplicates_structured_content(fallback, structured, structured_json):
-                            continue
-                    result.append(Content.from_text(fallback, **additional_kwargs))
+                    content_result.append(Content.from_text(str(item), **additional_kwargs))
+
+        structured_result = (
+            [Content.from_text(json.dumps(mcp_type.structuredContent, default=str), **additional_kwargs)]
+            if mcp_type.structuredContent is not None
+            else []
+        )
+        match self.result_content_mode:
+            case "structured_first":
+                result = structured_result or content_result
+            case "content_first":
+                result = content_result or structured_result
+            case "content_only":
+                result = content_result
+            case "structured_only":
+                result = structured_result
+            case "both":
+                result = [*structured_result, *content_result]
 
         if not result:
             result.append(Content.from_text("null", **additional_kwargs))
@@ -2802,6 +2802,7 @@ class MCPStdioTool(MCPTool):
         additional_properties: dict[str, Any] | None = None,
         task_options: MCPTaskOptions | None = None,
         additional_tool_argument_names: Sequence[str] | Mapping[str, Sequence[str]] | None = None,
+        result_content_mode: MCPResultContentMode = "structured_first",
         **kwargs: Any,
     ) -> None:
         """Initialize the MCP stdio tool.
@@ -2903,6 +2904,7 @@ class MCPStdioTool(MCPTool):
             request_timeout=request_timeout,
             task_options=task_options,
             additional_tool_argument_names=additional_tool_argument_names,
+            result_content_mode=result_content_mode,
             sampling_approval_callback=sampling_approval_callback,
             sampling_max_tokens=sampling_max_tokens,
             sampling_max_requests=sampling_max_requests,
@@ -2991,6 +2993,7 @@ class MCPStreamableHTTPTool(MCPTool):
         header_provider: Callable[[dict[str, Any]], dict[str, str]] | None = None,
         task_options: MCPTaskOptions | None = None,
         additional_tool_argument_names: Sequence[str] | Mapping[str, Sequence[str]] | None = None,
+        result_content_mode: MCPResultContentMode = "structured_first",
         **kwargs: Any,
     ) -> None:
         """Initialize the MCP streamable HTTP tool.
@@ -3114,6 +3117,7 @@ class MCPStreamableHTTPTool(MCPTool):
             request_timeout=request_timeout,
             task_options=task_options,
             additional_tool_argument_names=additional_tool_argument_names,
+            result_content_mode=result_content_mode,
             sampling_approval_callback=sampling_approval_callback,
             sampling_max_tokens=sampling_max_tokens,
             sampling_max_requests=sampling_max_requests,
@@ -3291,6 +3295,7 @@ class MCPWebsocketTool(MCPTool):
         additional_properties: dict[str, Any] | None = None,
         task_options: MCPTaskOptions | None = None,
         additional_tool_argument_names: Sequence[str] | Mapping[str, Sequence[str]] | None = None,
+        result_content_mode: MCPResultContentMode = "structured_first",
         **kwargs: Any,
     ) -> None:
         """Initialize the MCP WebSocket tool.
@@ -3390,6 +3395,7 @@ class MCPWebsocketTool(MCPTool):
             request_timeout=request_timeout,
             task_options=task_options,
             additional_tool_argument_names=additional_tool_argument_names,
+            result_content_mode=result_content_mode,
             sampling_approval_callback=sampling_approval_callback,
             sampling_max_tokens=sampling_max_tokens,
             sampling_max_requests=sampling_max_requests,
