@@ -2292,6 +2292,80 @@ async def test_function_invocation_config_terminate_on_unknown_calls_true(chat_c
     assert exec_counter == 0
 
 
+@pytest.mark.parametrize("declaration_first", [True, False], ids=["declaration-first", "approval-first"])
+async def test_mixed_batch_always_require_approval_takes_precedence_over_declaration_only(
+    declaration_first: bool,
+) -> None:
+    """An approval pause must not depend on the position of a declaration-only sibling."""
+    from agent_framework import FunctionTool
+    from agent_framework._tools import _try_execute_function_call_groups
+
+    @tool(name="guarded", approval_mode="always_require")
+    def guarded() -> str:
+        return "should not run"
+
+    declaration_only = FunctionTool(name="external", description="Handled by the host", func=None)
+    guarded_call = Content.from_function_call(call_id="guarded-call", name="guarded", arguments={})
+    declaration_call = Content.from_function_call(call_id="external-call", name="external", arguments={})
+    calls = [declaration_call, guarded_call] if declaration_first else [guarded_call, declaration_call]
+
+    result_groups, should_terminate = await _try_execute_function_call_groups(
+        custom_args={}, function_calls=calls, tools=[guarded, declaration_only], config={}
+    )
+
+    assert not should_terminate
+    approval_requests = [
+        content for group in result_groups for content in group if content.type == "function_approval_request"
+    ]
+    assert any(request.function_call.name == "guarded" for request in approval_requests)
+
+
+async def test_mixed_batch_always_require_approval_takes_precedence_over_unknown_termination() -> None:
+    """An unknown call cannot mask an approval pause when unknown-call termination is enabled."""
+    from agent_framework._tools import _try_execute_function_call_groups
+
+    @tool(name="guarded", approval_mode="always_require")
+    def guarded() -> str:
+        return "should not run"
+
+    result_groups, should_terminate = await _try_execute_function_call_groups(
+        custom_args={},
+        function_calls=[
+            Content.from_function_call(call_id="unknown-call", name="unknown", arguments={}),
+            Content.from_function_call(call_id="guarded-call", name="guarded", arguments={}),
+        ],
+        tools=[guarded],
+        config={"terminate_on_unknown_calls": True},
+    )
+
+    assert not should_terminate
+    approval_requests = [
+        content for group in result_groups for content in group if content.type == "function_approval_request"
+    ]
+    assert any(request.function_call.name == "guarded" for request in approval_requests)
+
+
+async def test_mixed_batch_declaration_only_takes_precedence_over_unknown_termination() -> None:
+    """A declaration-only pause also takes precedence over an unknown-call termination."""
+    from agent_framework import FunctionTool
+    from agent_framework._tools import _try_execute_function_call_groups
+
+    declaration_only = FunctionTool(name="external", description="Handled by the host", func=None)
+    result_groups, should_terminate = await _try_execute_function_call_groups(
+        custom_args={},
+        function_calls=[
+            Content.from_function_call(call_id="unknown-call", name="unknown", arguments={}),
+            Content.from_function_call(call_id="external-call", name="external", arguments={}),
+        ],
+        tools=[declaration_only],
+        config={"terminate_on_unknown_calls": True},
+    )
+
+    assert not should_terminate
+    paused_calls = [content for group in result_groups for content in group]
+    assert all(content.type == "function_call" and content.user_input_request for content in paused_calls)
+
+
 async def test_function_invocation_config_additional_tools(chat_client_base: SupportsChatGetResponse):
     """Test that additional_tools are available but treated as declaration_only."""
     exec_counter_visible = 0

@@ -1758,10 +1758,10 @@ async def _try_execute_function_call_groups(
         function_call for function_call in function_calls if _is_actionable_function_call(function_call)
     ]
 
-    # Classify the entire batch first: any required user interaction pauses the batch before execution.
+    # Classify the complete batch before choosing a control-flow path. A pause must
+    # not depend on where its call appears in the model's batch.
     requires_approval = False
     has_declaration_only_call = False
-    # A user-input pause takes precedence over unknown-call termination in mixed batches.
     for function_call in actionable_calls:
         function_name = function_call.name
         logger.debug(
@@ -1773,12 +1773,8 @@ async def _try_execute_function_call_groups(
         if function_name in approval_tool_names:
             logger.debug("Approval needed for function: %s", function_name)
             requires_approval = True
-            break
-        if function_name in declaration_only_tool_names or function_name in additional_tool_names:
+        elif function_name in declaration_only_tool_names or function_name in additional_tool_names:
             has_declaration_only_call = True
-            break
-        if config.get("terminate_on_unknown_calls", False) and function_name not in tool_map:
-            raise KeyError(f'Error: Requested function "{function_name}" not found.')
     if requires_approval:
         # Surface only the approvals the host must decide; session-backed safe siblings wait for that resume.
         # approval can only be needed for Function Call Content, not Approval Responses.
@@ -1827,6 +1823,14 @@ async def _try_execute_function_call_groups(
                 function_call.id = function_call.call_id
                 declaration_only_calls.append(function_call)
         return [[function_call] for function_call in declaration_only_calls], False
+
+    if config.get("terminate_on_unknown_calls", False):
+        unknown_call = next(
+            (function_call for function_call in actionable_calls if function_call.name not in tool_map),
+            None,
+        )
+        if unknown_call is not None:
+            raise KeyError(f'Error: Requested function "{unknown_call.name}" not found.')
 
     # Only a fully executable batch reaches this point; run calls concurrently but retain per-call result groups.
     # Create each task inside a copied context so the active agent span is
